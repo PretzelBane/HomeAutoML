@@ -1,0 +1,191 @@
+definition(
+    name: "ZZ Code Test - ML Flatfile Approach",
+    namespace: "Development",
+    author: "RAP",
+    description: "Attempt to create a map-style record of various factors on trigger; ultimately to use in ML to dictate results",
+    category: "Development",
+    iconUrl: "",
+    iconX2Url: "")
+
+preferences {
+    section("Factors") {
+        input name: "Imotions", type: "capability.motionSensor", title: "Motion Sensors", multiple: true
+        input name: "Icameras", type: "capability.switch", title: "Camera Motion Switches", multiple: true
+        input name: "Idoors", type: "capability.contactSensor", title: "Door Contacts", multiple: true
+        input name: "Iluxes", type: "capability.illuminanceMeasurement", title: "Illumination Sensors", multiple: true
+        input name: "Itemps", type: "capability.temperatureMeasurement", title: "Temperature Sensors", multiple: false
+        input name: "Ipowers", type: "capability.powerMeter", title: "Power Sensors", multiple: true
+        input name: "Iweathers", type: "capability.switch", title: "Weather Virtual Switches", multiple: true  
+        input name: "Iexternals", type: "capability.switch", title: "External Variable Virtual Switches", multiple: true   
+    }
+    section("Results") {
+        input name: "Ireport", type: "capability.switch", title: "Report Switch", required: true, multiple: false
+    }
+    section("Reset") {
+        input name: "Ireset", type: "capability.switch", title: "Reset Switch", required: true, multiple: false
+    }
+}
+
+
+def installed() {
+    log.debug ("INSTALL")
+    updated()
+}
+
+def updated() {
+    unsubscribe()
+    subscribe(Ireport, "switch", "reportHandler")   
+    subscribe(Ireset, "switch", "resetHandler")       
+    subscribe(Imotions, "motion", "motionHandler")
+    reset()
+}
+    
+def reset() {    
+    log.debug("RESET")        
+    // clear the maps to start over
+    // rebuild them as empty with a key for each action switch
+    //... might need to put more maps and maybe even variables in here  -- like, the factorMap?
+    state.actionMap = [:]
+    state.inactionMap = [:]
+    state.activityMap = [:]
+    settings.Imotions.each{ it ->
+        emptyList = []
+        state.actionMap.put(it.id,emptyList)
+        state.inactionMap.put(it.id,emptyList)
+        state.activityMap.put(it.id,emptyList)
+    }                     
+}
+
+def uninstalled() {}
+
+// handler for manual call for reset -- also called upon install
+// just calls the reset function
+def resetHandler(evt) {
+    if (evt.value == "on") {
+        reset()
+    }
+}
+
+
+// the report switch sets off the creation of the factorMap
+def reportHandler(evt) {
+    if (evt.value == "on") {
+        log.debug("REPORT")
+        
+        // create the empty map
+        state.factorMap = [:]
+      
+        // add the time-based values
+        // calculate date variables
+        Date dateNow = new Date()
+        epochNow = dateNow.getTime() 
+        Calendar calendar = Calendar.getInstance()
+        calendar.setTime(dateNow)
+        Integer month = dateNow.month + 1
+        Integer day = calendar.get(Calendar.DAY_OF_WEEK)
+        Integer hour = dateNow.hours
+        Integer minute = dateNow.minutes
+        Integer time = (hour*60)+minute
+        // add the date values to the map
+        state.factorMap.put("MONTH",month)
+        state.factorMap.put("WEEKDAY",day)       
+        state.factorMap.put("TIME",time)
+
+        // add the weather value
+        Iweathers.each{it->
+            if(it.currentValue("switch") == "on") {
+                String enviro = it
+                state.factorMap.put("WEATHER",enviro)
+            }
+        }
+        
+        // add the local temperature
+        state.factorMap.put("TEMP",Itemps.currentValue("temperature"))
+
+        // add the average lux
+        Integer sum = 0
+        Integer count = 0
+        Iluxes.each{it->
+            sum = sum + it.currentValue("illuminance")
+            count++
+        }
+        state.factorMap.put("LUX",sum/count)
+        
+        // add 1-hour activity percentages for each motion device
+        // Trim the maps to 1 hour (3,600,000 ms) & find the cutoff in epoch    
+        epochCutoff = epochNow - 3600000              
+        // trim the action and inaction maps (for each device) to keep only entries after the cutoff date        
+        // loop through the action and inaction map key:value pairs
+        // use findAll to find and retain only key:value pairs where the value is after the cutoff       
+        state.activityMap.each{ itDevice -> 
+            state.actionMap[itDevice.key] = state.actionMap[itDevice.key].findAll{ v -> v > epochCutoff}    
+            state.inactionMap[itDevice.key] = state.inactionMap[itDevice.key].findAll{ v -> v > epochCutoff}              
+        }       
+        // align the action and inaction lists so that each index is an action and inaction reprsenting time in action & use that to create the activity lists      
+        // start an outer loop that goes through each motion device (as added to the activityMap, above)
+        state.activityMap.each { itDevice -> 
+            // Not sure why, but clearing out the activity map value seems to prevent error
+            state.activityMap[itDevice.key] = []
+            // if 1-hour window started with device active, add the cutoff as the initial action
+            if (state.inactionMap[itDevice.key].size > 0) {
+                if (state.actionMap[itDevice.key][0] > state.inactionMap[itDevice.key][0]) {
+                    state.actionMap[itDevice.key].add(0, epochCutoff)    
+                }
+            }       
+            // if 1-hour window ended with device active, add the now as the final inaction
+            if (state.actionMap[itDevice.key].size > 0) {
+                if (state.inactionMap[itDevice.key].size == 0) {
+                    state.inactionMap[itDevice.key].add(epochNow) 
+                } else {
+                    if (state.actionMap[itDevice.key][-1] > state.inactionMap[itDevice.key][-1]) {            
+                        state.inactionMap[itDevice.key].add(epochNow) 
+                    }
+                }
+            }    
+            // now that actions and inactions are aligned in their respective lists, create the activiy list which is the time between action and inaction
+            if (state.actionMap[itDevice.key].size > 0) {            
+                state.actionMap[itDevice.key].eachWithIndex { itAction, itIndex ->                             
+                    state.activityMap[itDevice.key].add(state.inactionMap[itDevice.key][itIndex] - state.actionMap[itDevice.key][itIndex]) 
+                }
+            }            
+            // add up the activity periods and divide by the full hour to get a %activity 
+            // replace the list of periods in the activity map with the %activity
+            // end result is the activityMap, a map of device:%activity (no lists anymore)
+            if (itDevice.value) {
+                itDevice.value = itDevice.value.sum() / 3600000    
+            } else {
+            itDevice.value = 0
+            }   
+            
+            log.debug("ACTIVITY MAP *3*: ${state.activityMap}")
+        }            
+        state.activityMap.each { itDevice -> 
+            state.factorMap.put("ACTIVITY-${itDevice.key}",itDevice.value)
+        }
+        // print the map results (eventually replace this logging with exporting)
+        log.debug("FACTOR MAP")
+        state.factorMap.each { it ->
+            log.debug ("${it.key} : ${it.value}")
+        }
+
+    }
+}
+
+
+def motionHandler(evt) {
+    log.debug "MOTION EVENT: ${evt.name} ${evt.value} ${evt.device} ${evt.displayName}"
+    // add the epoch to the appropriate map and triggered device
+    Date dateNow = new Date()
+    epochNow = dateNow.getTime()    
+    if (evt.value == "active") {
+        state.actionMap[evt.device.id].add(epochNow)      
+    } else {
+        state.inactionMap[evt.device.id].add(epochNow)      
+    }
+}
+        
+
+
+
+
+
